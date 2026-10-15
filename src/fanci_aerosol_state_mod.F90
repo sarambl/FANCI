@@ -57,9 +57,12 @@ module fanci_aerosol_state_mod
      type(aerosol_range_state), allocatable :: aero_range_state(:)
      integer :: ncol
      integer :: lchnk
+     ! .true. on a copy that was initialised from the master's cloud-borne state and
+     ! has not yet been written back with commit_cloudborne
+     logical :: needs_commit = .false.
 
-   contains
-
+  contains
+     procedure :: commit_cloudborne             ! write cloud-borne state of a copy back to the master
      procedure :: get_transported               ! done
      procedure :: set_transported               ! done
      procedure :: ambient_total_bin_mmr         ! done
@@ -118,6 +121,7 @@ contains
     character(len=10)             :: speciesname, speciesname_props
     logical :: solsym_found
     integer :: icol, iver
+    type(fanci_aerosol_state), pointer :: master => null()
     character(len=*), parameter :: subname = 'constructor'
 
     make_copy = .false.
@@ -292,7 +296,19 @@ contains
                 call endrun(subname//" :: ERROR: transport array index for "//trim(num_name)//' not found')
             end if
         end do
-
+        ! A copy starts from the master's persistent cloud-borne state. The caller
+        ! must hand the result back with commit_cloudborne() before destroying it.
+        if ( make_copy .and. associated(master_aero_state(lchnk)%ptr) ) then
+            master => master_aero_state(lchnk)%ptr
+            if ( size(master%bin_numconc_cw,1) /= newobj%ncol ) then
+                call endrun(subname//':: ERROR: copy ncol differs from master ncol')
+            end if
+            newobj%bin_numconc_cw = master%bin_numconc_cw
+            do irange = 1, newobj%sec_aero_props%nranges()
+                newobj%aero_range_state(irange)%mmr_cw = master%aero_range_state(irange)%mmr_cw
+            end do
+            newobj%needs_commit = .true.
+        end if
 
         if (.not. associated(master_aero_state(lchnk)%ptr)) then
             master_aero_state(lchnk)%ptr => newobj
@@ -314,11 +330,23 @@ contains
   subroutine destructor(self)
     type(fanci_aerosol_state), intent(inout) :: self
 
+    integer :: irange
     character(len=*), parameter :: subname = 'destructor'
+    if ( self%needs_commit .and. masterproc ) then
+        write(iulog,*) subname//': WARNING: fanci_aerosol_state copy destroyed without commit_cloudborne; cloud-borne changes lost'
+    end if
 
     nullify(self%state)
     nullify(self%pbuf)
     if (allocated(self%aero_range_state)) then
+        ! pointer components are not freed by deallocating the parent array
+        do irange = 1, size(self%aero_range_state)
+            if (associated(self%aero_range_state(irange)%mmr_cw)) then
+                deallocate(self%aero_range_state(irange)%mmr_cw)
+                nullify(self%aero_range_state(irange)%mmr_cw)
+            end if
+        end do
+
         deallocate(self%aero_range_state)
     end if
     if (associated(self%bin_numconc_cw)) then
@@ -341,6 +369,35 @@ contains
     nr_copies(self%lchnk) = nr_copies(self%lchnk) - 1
 
   end subroutine destructor
+
+    !------------------------------------------------------------------------------
+    ! Writes the cloud-borne state of a copy back to the master object, which owns
+    ! the persistent cloud-borne aerosol (not transported, carried across time steps).
+    ! Call once, after the last routine that modifies cloud-borne aerosol (dropmixnuc)
+    ! and before the copy is destroyed.
+    !------------------------------------------------------------------------------
+    subroutine commit_cloudborne(self)
+      class(fanci_aerosol_state), intent(inout) :: self
+    
+      type(fanci_aerosol_state), pointer :: master
+      integer :: irange
+      character(len=*), parameter :: subname = 'commit_cloudborne'
+
+      if ( .not. self%needs_commit ) return   ! the master itself (or an already committed copy)
+
+      master => master_aero_state(self%lchnk)%ptr
+      if ( .not. associated(master) ) then
+          call endrun(subname//':: ERROR: no master aerosol state to commit to')
+      end if
+
+      master%bin_numconc_cw = self%bin_numconc_cw
+      do irange = 1, size(self%aero_range_state)
+          master%aero_range_state(irange)%mmr_cw = self%aero_range_state(irange)%mmr_cw
+      end do
+
+      self%needs_commit = .false.
+
+    end subroutine commit_cloudborne
 
   !------------------------------------------------------------------------------
   ! sets transported components
